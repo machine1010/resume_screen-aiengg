@@ -1,39 +1,48 @@
-import streamlit as st
-import os
-import tempfile
-import pandas as pd
+import datetime
 from typing import List
-from pydantic import BaseModel, Field
+
+import pandas as pd
+import streamlit as st
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# 1. Pydantic Output Schema
+# 1. Output schema (matches the prompt below)
 # ---------------------------------------------------------------------------
-class AuditCheckItem(BaseModel):
-    check_name: str = Field(
-        description="Name of the check executed (e.g., Experience Range Filter, Blacklisted Project Check, Recent Skills Check)."
-    )
-    outcome: str = Field(
-        description="Detailed findings, evidence, date calculations, or detected blacklisted terms."
-    )
-    flag_status: str = Field(
-        description="Flag level: PASS, YELLOW_FLAG, RED_FLAG, PROCEED, PROCEED_WITH_CAUTION, FLAG_FOR_AUDIT, or REJECT."
-    )
+class AuditCheck(BaseModel):
+    id: int = Field(description="Check number, 1 to 11.")
+    name: str = Field(description="Check name, e.g. 'Career Gaps'.")
+    status: str = Field(description="GREEN, AMBER or RED.")
+    finding: str = Field(description="Short finding with evidence from the resume.")
 
-class CandidateResumeAudit(BaseModel):
-    candidate_name: str = Field(
-        description="The full name of the candidate extracted from the resume."
-    )
-    checks: List[AuditCheckItem]
+
+class CandidateAudit(BaseModel):
+    full_name: str
+    email: str
+    phone: str
+    current_title: str
+    current_employer: str
+    notice_period: str = Field(description="'Immediate' if no current employer on the resume, else as stated, else NOT_STATED.")
+    total_experience_years: float = Field(description="Number only.")
+    relevant_ai_experience_years: float = Field(description="Number only.")
+    top_skills: List[str]
+    missing_must_haves: List[str]
+    achievements: List[str] = Field(description="Top 3, keep numbers exactly as written.")
+    discrepancies: List[str]
+    checks: List[AuditCheck] = Field(description="Exactly 11 entries, one per check, in order.")
+    interview_questions: List[str] = Field(description="3 questions targeting the weakest claims.")
+    recommendation: str = Field(description="PASS, PROCEED_WITH_CAUTION, FLAG_FOR_AUDIT or REJECT.")
+    reason: str
+
 
 # ---------------------------------------------------------------------------
-# 2. Base System Instruction Template
+# 2. System instruction
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION_TEMPLATE = """
 You are an expert technical recruiter and resume authenticity reviewer, screening candidates for an AI Engineer role.
-Analyze the candidate's resume PDF. Use web lookups only to verify employers and tool release dates.
-Today's date is {current_date}.
+Analyze the candidate's resume PDF.
+Today's date is {current_date}. Treat "Present" / "Current" as today's date.
 
 ROLE SUMMARY
 6-8 years of application development with a focus on AI. Builds internal AI tools and workflows (Claude, Cursor)
@@ -53,14 +62,15 @@ AUTHENTICITY CHECKS
    One jump = AMBER, two or more = RED.
 6. AI Timeline Check: Flag claims impossible by date - GenAI/LLM experience before Nov 2022, LangGraph before 2024,
    MCP before Nov 2024, Claude Code before 2025. One = AMBER, two or more = RED.
-7. Employer Check: Quick web check that employers from the last 5 years exist. Not found = AMBER.
+7. Employer Check: List employers from the last 5 years. Mark any you cannot recognise, or that have no
+   details (location, clients, domain), as UNVERIFIED for manual check = AMBER.
 8. Blacklisted Projects: Compare listed projects against this blacklist:
-    {blacklisted_projects_str}
+{blacklisted_projects_str}
    Any match = RED.
 
 ROLE FIT CHECKS
 9. Experience: Total full-time experience (overlaps counted once, internships excluded).
-   6-8 years = GREEN, 4.5-5 or 8-10 years = AMBER, otherwise RED. Also extract relevant AI experience in years.
+   6-8 years = GREEN, 5-6 or 8-10 years = AMBER, otherwise RED. Also extract relevant AI experience in years.
 10. Recent Skills (last 1 year): A skill counts only if it appears in a project from the last 12 months, not just the skills list.
     Must-have: Python/TypeScript, LLM APIs (Claude, OpenAI, etc.), RAG, Function Calling / Structured Outputs,
     Agents / Workflow Orchestration, AI Evaluation & Guardrails.
@@ -75,116 +85,91 @@ RECOMMENDATION (apply the first rule that matches)
 - PROCEED_WITH_CAUTION: 2 or more AMBERs.
 - PASS: Everything else.
 
-OUTPUT
-Return only valid JSON in this structure:
-{{
-  "full_name": "",
-  "email": "",
-  "phone": "",
-  "current_title": "",
-  "current_employer": "",
-  "notice_period": "",                  // "Immediate" if no current employer on the resume
-  "total_experience_years": 0,          // number only
-  "relevant_ai_experience_years": 0,    // number only
-  "top_skills": [],
-  "missing_must_haves": [],
-  "achievements": [],                   // top 3, keep numbers as written
-  "discrepancies": [],
-  "checks": [{{"id": 1, "name": "", "status": "GREEN | AMBER | RED", "finding": ""}}],
-  "interview_questions": [],            // 3 questions targeting the weakest claims
-  "recommendation": "PASS | PROCEED_WITH_CAUTION | FLAG_FOR_AUDIT | REJECT",
-  "reason": ""
-}}
+Return the result in the JSON structure defined by the response schema.
 """
 
+MODEL_NAME = "gemini-2.5-flash"
+
 
 # ---------------------------------------------------------------------------
-# 3. Processing Function (Option 2: Vertex AI Direct Bytes Injection)
+# 3. Processing
 # ---------------------------------------------------------------------------
-def process_candidate_resumes(api_key: str, uploaded_files_list: List, blacklisted_projects: List[str]) -> pd.DataFrame:
-    # Initialize client for Vertex AI
-    client = genai.Client(vertexai=True, api_key=api_key)
+def process_candidate_resumes(api_key: str, use_vertex: bool, uploaded_files_list: List,
+                              blacklisted_projects: List[str]):
+    # Inline PDF bytes work with both key types and avoid the Files API upload call.
+    client = genai.Client(vertexai=use_vertex, api_key=api_key)
 
-    # Format blacklist into bulleted string
-    blacklist_formatted = "\n".join([f"- {proj}" for proj in blacklisted_projects])
-
-    # Build complete prompt with dynamic blacklist
+    blacklist_formatted = "\n".join(f"    - {proj}" for proj in blacklisted_projects) or "    - (none)"
     system_instruction = SYSTEM_INSTRUCTION_TEMPLATE.format(
-        blacklisted_projects_str=blacklist_formatted
+        current_date=datetime.date.today().strftime("%d %B %Y"),
+        blacklisted_projects_str=blacklist_formatted,
     )
 
-    all_report_rows = []
+    summary_rows, check_rows = [], []
 
     for uploaded_file in uploaded_files_list:
         file_name = uploaded_file.name
-        
         try:
-            # Read raw binary data directly from Streamlit's UploadedFile object
-            pdf_bytes = uploaded_file.getvalue()
+            pdf_part = types.Part.from_bytes(data=uploaded_file.getvalue(), mime_type="application/pdf")
 
-            # Create a inline Part object using types.Part.from_bytes
-            pdf_part = types.Part.from_bytes(
-                data=pdf_bytes,
-                mime_type="application/pdf"
-            )
-
-            # Generate content using inline PDF bytes
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    pdf_part,
-                    f"Perform a full forensic audit on '{file_name}'. Verify total work experience is 4-8 years, scan for recent skills in 1-year projects, check against blacklisted projects, and execute all 11 audit checks."
-                ],
+                model=MODEL_NAME,
+                contents=[pdf_part, f"Run all 11 checks on the resume '{file_name}'."],
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     response_mime_type="application/json",
-                    response_schema=CandidateResumeAudit,
+                    response_schema=CandidateAudit,
+                    temperature=0,
                 ),
             )
+            a = CandidateAudit.model_validate_json(response.text)
+            statuses = {c.id: c.status for c in a.checks}
 
-            # Parse JSON output via Pydantic
-            audit_result = CandidateResumeAudit.model_validate_json(response.text)
-
-            for check in audit_result.checks:
-                all_report_rows.append({
-                    "Candidate Name": audit_result.candidate_name,
-                    "File Name": file_name,
-                    "Check Name": check.check_name,
-                    "Findings / Outcome": check.outcome,
-                    "Flag Status": check.flag_status
+            summary_rows.append({
+                "File Name": file_name,
+                "Name": a.full_name,
+                "Email": a.email,
+                "Phone": a.phone,
+                "Current Title": a.current_title,
+                "Current Employer": a.current_employer,
+                "Notice Period": a.notice_period,
+                "Total Experience": a.total_experience_years,
+                "Relevant AI Experience": a.relevant_ai_experience_years,
+                "Recommendation": a.recommendation,
+                "Reason": a.reason,
+                "RED Checks": sum(s == "RED" for s in statuses.values()),
+                "AMBER Checks": sum(s == "AMBER" for s in statuses.values()),
+                "Top Skills": ", ".join(a.top_skills),
+                "Missing Must-Haves": ", ".join(a.missing_must_haves),
+                "Achievements": " | ".join(a.achievements),
+                "Discrepancies": " | ".join(a.discrepancies),
+                "Interview Questions": " | ".join(a.interview_questions),
+            })
+            for c in a.checks:
+                check_rows.append({
+                    "File Name": file_name, "Name": a.full_name,
+                    "Check #": c.id, "Check": c.name, "Status": c.status, "Finding": c.finding,
                 })
 
         except Exception as e:
-            all_report_rows.append({
-                "Candidate Name": "Unknown",
-                "File Name": file_name,
-                "Check Name": "Processing Error",
-                "Findings / Outcome": f"Failed to audit: {str(e)}",
-                "Flag Status": "RED_FLAG"
-            })
+            summary_rows.append({"File Name": file_name, "Name": "Unknown",
+                                 "Recommendation": "ERROR", "Reason": f"Failed to audit: {e}"})
 
-    return pd.DataFrame(all_report_rows)
+    return pd.DataFrame(summary_rows), pd.DataFrame(check_rows)
+
 
 # ---------------------------------------------------------------------------
-# 4. Streamlit User Interface
+# 4. Streamlit UI
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Resume Auditor", layout="wide")
+st.title("🕵️‍♂️ HR Resume Scanner — AI Engineer")
+st.markdown("Upload candidate resumes (PDFs) to run the 11-point audit and download the results as CSV.")
 
-st.title("🕵️‍♂️ HR Resume Scanner")
-st.markdown("Upload candidate resumes (PDFs) to run a forensic 11-point audit and download the results as a CSV.")
-
-# --- Sidebar Controls ---
 with st.sidebar:
     st.header("Configuration")
-    
-    # Securely handle the API key
-    api_key_input = st.text_input(
-        "Vertex AI / Express API Key", 
-        type="password", 
-        help="Provide your authentication key."
-    )
-    
-    # Editable Blacklist Projects
+    key_type = st.radio("Key type", ["Vertex AI (Express) key", "Google AI Studio key"])
+    api_key_input = st.text_input("API Key", type="password")
+
     st.subheader("Blacklisted Projects")
     default_blacklist = (
         "Project Titan - Online Banking System (Proxy Template)\n"
@@ -194,7 +179,6 @@ with st.sidebar:
     )
     blacklist_text = st.text_area("Enter one project per line:", value=default_blacklist, height=200)
 
-# --- Main Area ---
 uploaded_files = st.file_uploader("Upload PDF Resumes", type=["pdf"], accept_multiple_files=True)
 
 if st.button("Run Audit"):
@@ -203,24 +187,21 @@ if st.button("Run Audit"):
     elif not uploaded_files:
         st.warning("Please upload at least one PDF file.")
     else:
-        # Parse blacklist textarea into a Python list
         blacklist_projects = [line.strip() for line in blacklist_text.split("\n") if line.strip()]
-        
-        # Run Process using memory streams (no disk writing needed)
-        with st.spinner(f"Auditing {len(uploaded_files)} resume(s)... This may take a minute."):
-            result_df = process_candidate_resumes(api_key_input, uploaded_files, blacklist_projects)
-        
+        with st.spinner(f"Auditing {len(uploaded_files)} resume(s)..."):
+            summary_df, checks_df = process_candidate_resumes(
+                api_key_input, key_type.startswith("Vertex"), uploaded_files, blacklist_projects
+            )
+
         st.success("Audit Complete!")
-        
-        # Display preview
-        st.subheader("Audit Results Preview")
-        st.dataframe(result_df, use_container_width=True)
-        
-        # Convert DF to CSV and create a download button
-        csv_data = result_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download Full Report (CSV)",
-            data=csv_data,
-            file_name="screen_results.csv",
-            mime="text/csv",
-        )
+
+        st.subheader("Candidate Summary")
+        st.dataframe(summary_df, use_container_width=True)
+        st.download_button("📥 Download Summary (CSV)", summary_df.to_csv(index=False).encode("utf-8"),
+                           file_name="screen_summary.csv", mime="text/csv")
+
+        if not checks_df.empty:
+            st.subheader("Check Details")
+            st.dataframe(checks_df, use_container_width=True)
+            st.download_button("📥 Download Check Details (CSV)", checks_df.to_csv(index=False).encode("utf-8"),
+                               file_name="screen_check_details.csv", mime="text/csv")
