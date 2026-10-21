@@ -88,7 +88,7 @@ RECOMMENDATION (apply the first rule that matches)
 Return the result in the JSON structure defined by the response schema.
 """
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 
 
 # ---------------------------------------------------------------------------
