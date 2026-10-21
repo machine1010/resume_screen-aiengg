@@ -130,7 +130,7 @@ def process_candidate_resumes(api_key: str, uploaded_files_list: List, blacklist
 
             # Generate content using inline PDF bytes
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-2.5-flash",
                 contents=[
                     pdf_part,
                     f"Perform a full forensic audit on '{file_name}'. Verify total work experience is 4-8 years, scan for recent skills in 1-year projects, check against blacklisted projects, and execute all 11 audit checks."
