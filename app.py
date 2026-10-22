@@ -1,4 +1,5 @@
 import datetime
+import base64
 from typing import List
 
 import pandas as pd
@@ -110,7 +111,13 @@ def process_candidate_resumes(api_key: str, use_vertex: bool, uploaded_files_lis
     for uploaded_file in uploaded_files_list:
         file_name = uploaded_file.name
         try:
-            pdf_part = types.Part.from_bytes(data=uploaded_file.getvalue(), mime_type="application/pdf")
+            pdf_b64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+            pdf_part = {
+                "inline_data": {
+                    "mime_type": "application/pdf",
+                    "data": pdf_b64
+                }
+            }
 
             response = client.models.generate_content(
                 model=MODEL_NAME,
