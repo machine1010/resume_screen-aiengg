@@ -1,6 +1,5 @@
 import datetime
-import base64
-from typing import List
+from typing import List, Literal
 
 import pandas as pd
 import streamlit as st
@@ -9,36 +8,21 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# 1. Output schema (matches the prompt below)
+# 1. Pydantic Output Schema
 # ---------------------------------------------------------------------------
-class AuditCheck(BaseModel):
-    id: int = Field(description="Check number, 1 to 11.")
-    name: str = Field(description="Check name, e.g. 'Career Gaps'.")
-    status: str = Field(description="GREEN, AMBER or RED.")
-    finding: str = Field(description="Short finding with evidence from the resume.")
+class AuditCheckItem(BaseModel):
+    check_name: str = Field(description="Exact check name from the prompt.")
+    outcome: str = Field(description="Short finding with evidence (dates, role or project name).")
+    flag_status: Literal["PASS", "PROCEED_WITH_CAUTION", "FLAG_FOR_AUDIT"]
 
 
-class CandidateAudit(BaseModel):
-    full_name: str
-    email: str
-    phone: str
-    current_title: str
-    current_employer: str
-    notice_period: str = Field(description="'Immediate' if no current employer on the resume, else as stated, else NOT_STATED.")
-    total_experience_years: float = Field(description="Number only.")
-    relevant_ai_experience_years: float = Field(description="Number only.")
-    top_skills: List[str]
-    missing_must_haves: List[str]
-    achievements: List[str] = Field(description="Top 3, keep numbers exactly as written.")
-    discrepancies: List[str]
-    checks: List[AuditCheck] = Field(description="Exactly 11 entries, one per check, in order.")
-    interview_questions: List[str] = Field(description="3 questions targeting the weakest claims.")
-    recommendation: str = Field(description="PASS, PROCEED_WITH_CAUTION, FLAG_FOR_AUDIT or REJECT.")
-    reason: str
+class CandidateResumeAudit(BaseModel):
+    candidate_name: str = Field(description="The full name of the candidate extracted from the resume.")
+    checks: List[AuditCheckItem] = Field(description="Exactly 12 entries, one per check, in order.")
 
 
 # ---------------------------------------------------------------------------
-# 2. System instruction
+# 2. System Instruction Template
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION_TEMPLATE = """
 You are an expert HR Forensic Auditor and Resume Authenticity Specialist, screening candidates for an AI Engineer role.
@@ -91,17 +75,15 @@ AUDIT CHECKS TO EXECUTE (use these exact check names, in this order):
     In the finding, give the deciding reasons in 1-2 sentences.
 """
 
-
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_COLUMNS = ["Candidate Name", "File Name", "Check Name", "Findings / Outcome", "Flag Status"]
 
 
 # ---------------------------------------------------------------------------
-# 3. Processing
+# 3. Processing Function (inline PDF bytes - no file upload API needed)
 # ---------------------------------------------------------------------------
 def process_candidate_resumes(api_key: str, use_vertex: bool, uploaded_files_list: List,
-                              blacklisted_projects: List[str]):
-    # Inline PDF bytes work with both key types and avoid the Files API upload call.
+                              blacklisted_projects: List[str]) -> pd.DataFrame:
     client = genai.Client(vertexai=use_vertex, api_key=api_key)
 
     blacklist_formatted = "\n".join(f"    - {proj}" for proj in blacklisted_projects) or "    - (none)"
@@ -110,71 +92,48 @@ def process_candidate_resumes(api_key: str, use_vertex: bool, uploaded_files_lis
         blacklisted_projects_str=blacklist_formatted,
     )
 
-    summary_rows, check_rows = [], []
-
+    rows = []
     for uploaded_file in uploaded_files_list:
         file_name = uploaded_file.name
         try:
-            pdf_b64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
-            pdf_part = {
-                "inline_data": {
-                    "mime_type": "application/pdf",
-                    "data": pdf_b64
-                }
-            }
-
+            pdf_part = types.Part.from_bytes(data=uploaded_file.getvalue(), mime_type="application/pdf")
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=[pdf_part, f"Run all 11 checks on the resume '{file_name}'."],
+                contents=[pdf_part, f"Run all 12 audit checks on the resume '{file_name}'."],
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     response_mime_type="application/json",
-                    response_schema=CandidateAudit,
+                    response_schema=CandidateResumeAudit,
                     temperature=0,
                 ),
             )
-            a = CandidateAudit.model_validate_json(response.text)
-            statuses = {c.id: c.status for c in a.checks}
-
-            summary_rows.append({
-                "File Name": file_name,
-                "Name": a.full_name,
-                "Email": a.email,
-                "Phone": a.phone,
-                "Current Title": a.current_title,
-                "Current Employer": a.current_employer,
-                "Notice Period": a.notice_period,
-                "Total Experience": a.total_experience_years,
-                "Relevant AI Experience": a.relevant_ai_experience_years,
-                "Recommendation": a.recommendation,
-                "Reason": a.reason,
-                "RED Checks": sum(s == "RED" for s in statuses.values()),
-                "AMBER Checks": sum(s == "AMBER" for s in statuses.values()),
-                "Top Skills": ", ".join(a.top_skills),
-                "Missing Must-Haves": ", ".join(a.missing_must_haves),
-                "Achievements": " | ".join(a.achievements),
-                "Discrepancies": " | ".join(a.discrepancies),
-                "Interview Questions": " | ".join(a.interview_questions),
-            })
-            for c in a.checks:
-                check_rows.append({
-                    "File Name": file_name, "Name": a.full_name,
-                    "Check #": c.id, "Check": c.name, "Status": c.status, "Finding": c.finding,
+            audit = CandidateResumeAudit.model_validate_json(response.text)
+            for check in audit.checks:
+                rows.append({
+                    "Candidate Name": audit.candidate_name,
+                    "File Name": file_name,
+                    "Check Name": check.check_name,
+                    "Findings / Outcome": check.outcome,
+                    "Flag Status": check.flag_status,
                 })
-
         except Exception as e:
-            summary_rows.append({"File Name": file_name, "Name": "Unknown",
-                                 "Recommendation": "ERROR", "Reason": f"Failed to audit: {e}"})
+            rows.append({
+                "Candidate Name": "Unknown",
+                "File Name": file_name,
+                "Check Name": "Processing Error",
+                "Findings / Outcome": f"Failed to audit: {e}",
+                "Flag Status": "FLAG_FOR_AUDIT",
+            })
 
-    return pd.DataFrame(summary_rows), pd.DataFrame(check_rows)
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
 
 
 # ---------------------------------------------------------------------------
-# 4. Streamlit UI
+# 4. Streamlit User Interface
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Resume Auditor", layout="wide")
 st.title("🕵️‍♂️ HR Resume Scanner — AI Engineer")
-st.markdown("Upload candidate resumes (PDFs) to run the 11-point audit and download the results as CSV.")
+st.markdown("Upload candidate resumes (PDFs) to run the 12-point audit and download the results as a CSV.")
 
 with st.sidebar:
     st.header("Configuration")
@@ -199,20 +158,17 @@ if st.button("Run Audit"):
         st.warning("Please upload at least one PDF file.")
     else:
         blacklist_projects = [line.strip() for line in blacklist_text.split("\n") if line.strip()]
-        with st.spinner(f"Auditing {len(uploaded_files)} resume(s)..."):
-            summary_df, checks_df = process_candidate_resumes(
+        with st.spinner(f"Auditing {len(uploaded_files)} resume(s)... This may take a minute."):
+            result_df = process_candidate_resumes(
                 api_key_input, key_type.startswith("Vertex"), uploaded_files, blacklist_projects
             )
 
         st.success("Audit Complete!")
-
-        st.subheader("Candidate Summary")
-        st.dataframe(summary_df, use_container_width=True)
-        st.download_button("📥 Download Summary (CSV)", summary_df.to_csv(index=False).encode("utf-8"),
-                           file_name="screen_summary.csv", mime="text/csv")
-
-        if not checks_df.empty:
-            st.subheader("Check Details")
-            st.dataframe(checks_df, use_container_width=True)
-            st.download_button("📥 Download Check Details (CSV)", checks_df.to_csv(index=False).encode("utf-8"),
-                               file_name="screen_check_details.csv", mime="text/csv")
+        st.subheader("Audit Results Preview")
+        st.dataframe(result_df, use_container_width=True)
+        st.download_button(
+            label="📥 Download Full Report (CSV)",
+            data=result_df.to_csv(index=False).encode("utf-8"),
+            file_name="screen_results.csv",
+            mime="text/csv",
+        )
