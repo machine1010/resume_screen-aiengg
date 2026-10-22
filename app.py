@@ -93,6 +93,7 @@ AUDIT CHECKS TO EXECUTE (use these exact check names, in this order):
 
 
 MODEL_NAME = "gemini-3.8-flash"
+OUTPUT_COLUMNS = ["Candidate Name", "File Name", "Check Name", "Findings / Outcome", "Flag Status"]
 
 
 # ---------------------------------------------------------------------------
