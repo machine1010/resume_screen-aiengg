@@ -49,8 +49,7 @@ AUDIT CHECKS TO EXECUTE (use these exact check names, in this order):
 4. Company-to-Company Tenure Overlap: Two full-time jobs overlapping by more than 2 months = FLAG_FOR_AUDIT.
 5. Career Trajectory & Title Escalation: Unrealistic jumps (e.g., fresher to Lead in under 2 years,
    "Head of AI" with under 2 years of AI work). One jump = PROCEED_WITH_CAUTION, two or more = FLAG_FOR_AUDIT.
-6. AI Timeline Check: Flag claims impossible by date - GenAI/LLM experience before Nov 2022, LangGraph before 2024,
-   MCP before Nov 2024, Claude Code before 2025. One = PROCEED_WITH_CAUTION, two or more = FLAG_FOR_AUDIT.
+6. Snowflake Check: Check whether the candidate mentions Snowflake anywhere in the resume (work history, projects, skills, or tools list). Report where it was found. Snowflake mentioned = PASS, not mentioned = FLAG_FOR_AUDIT.
 7. Employer Check: List employers from the last 5 years. Any you cannot recognise, or with no details
    (location, clients, domain) = PROCEED_WITH_CAUTION for manual check.
 8. Blacklisted Project Audit: Compare listed projects against this blacklist:
